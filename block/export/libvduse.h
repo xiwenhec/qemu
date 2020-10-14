@@ -37,15 +37,51 @@ typedef struct VduseOps {
 
 typedef void (*VduseVQHandler)(VduseDev *dev, VduseVirtq *vq);
 
+typedef struct VduseDevLog {
+    uint8_t status;
+    uint64_t features;
+} VduseDevLog;
+
+typedef struct VduseVirtqLogVring {
+    uint64_t desc;
+    uint64_t avail;
+    uint64_t used;
+    uint32_t num;
+    uint8_t ready;
+} VduseVirtqLogVring;
+
+typedef struct VduseDescStateSplit {
+    uint8_t inflight;
+    uint8_t padding[5];
+    uint16_t next;
+    uint64_t counter;
+} VduseDescStateSplit;
+
+typedef struct VduseVirtqLogInflight {
+    uint64_t features;
+    uint16_t version;
+    uint16_t desc_num;
+    uint16_t last_batch_head;
+    uint16_t used_idx;
+    VduseDescStateSplit desc[];
+} VduseVirtqLogInflight;
+
+typedef struct VduseVirtqLog {
+    VduseVirtqLogVring vring;
+    VduseVirtqLogInflight inflight;
+} VduseVirtqLog;
+
 typedef struct VduseRing {
     unsigned int num;
-    uint64_t desc_addr;
-    uint64_t avail_addr;
-    uint64_t used_addr;
     struct vring_desc *desc;
     struct vring_avail *avail;
     struct vring_used *used;
 } VduseRing;
+
+typedef struct VduseVirtqInflightDesc {
+    uint16_t index;
+    uint64_t counter;
+} VduseVirtqInflightDesc;
 
 struct VduseVirtq {
     VduseRing vring;
@@ -61,10 +97,13 @@ struct VduseVirtq {
     int index;
     int inuse;
     bool enabled;
-    bool ready;
     EventNotifier kick_notifier;
     EventNotifier irq_notifier;
     VduseVQHandler handler;
+    VduseVirtqInflightDesc *resubmit_list;
+    uint16_t resubmit_num;
+    uint64_t counter;
+    VduseVirtqLog *log;
     VduseDev *dev;
 };
 
@@ -91,12 +130,12 @@ struct VduseDev {
     VduseVirtq *vqs;
     VduseIovaRegion regions[MAX_IOVA_REGIONS];
     int num_regions;
+    VduseDevLog *log;
     uint64_t id;
     uint32_t device_id;
     uint32_t vendor_id;
     uint16_t num_queues;
     uint16_t queue_size;
-    uint64_t features;
     const VduseOps *ops;
     int fd;
     int vduse_fd;

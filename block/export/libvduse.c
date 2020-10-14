@@ -21,6 +21,158 @@
 #include "hw/virtio/virtio.h"
 #include "libvduse.h"
 
+#define LOG_ALIGNMENT 64
+
+/* Round number down to multiple */
+#define ALIGN_DOWN(n, m) ((n) / (m) * (m))
+
+/* Round number up to multiple */
+#define ALIGN_UP(n, m) ALIGN_DOWN((n) + (m) - 1, (m))
+
+static inline size_t vduse_dev_log_size(void)
+{
+    return ALIGN_UP(sizeof(VduseDevLog), LOG_ALIGNMENT);
+}
+
+static inline size_t vduse_vq_log_size(uint16_t queue_size)
+{
+    return ALIGN_UP(sizeof(VduseVirtqLogVring) +
+                    sizeof(VduseDescStateSplit) * queue_size +
+                    sizeof(uint64_t) + sizeof(uint16_t) * 4, LOG_ALIGNMENT);
+}
+
+static void *vduse_log_get(const char *dir, uint64_t id, size_t size)
+{
+    void *ptr = MAP_FAILED;
+    char *path = g_strdup_printf("%s/vduse-log-%lu", dir, id);
+    int fd;
+
+    fd = open(path, O_RDWR | O_CREAT, 0600);
+    if (fd == -1) {
+        goto out;
+    }
+
+    if (ftruncate(fd, size) == -1) {
+        goto out;
+    }
+
+    ptr = mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (ptr == MAP_FAILED) {
+        goto out;
+    }
+out:
+    if (fd > 0) {
+        close(fd);
+    }
+    g_free(path);
+
+    return ptr;
+}
+
+static void vduse_log_destroy(const char *dir, uint64_t id)
+{
+    char *path = g_strdup_printf("%s/vduse-log-%lu", dir, id);
+
+    unlink(path);
+    g_free(path);
+}
+
+static int inflight_desc_compare(const void *a, const void *b)
+{
+    VduseVirtqInflightDesc *desc0 = (VduseVirtqInflightDesc *)a,
+                           *desc1 = (VduseVirtqInflightDesc *)b;
+
+    if (desc1->counter > desc0->counter &&
+        (desc1->counter - desc0->counter) < VIRTQUEUE_MAX_SIZE * 2) {
+        return 1;
+    }
+
+    return -1;
+}
+
+static int vduse_queue_check_inflights(VduseVirtq *vq)
+{
+    int i = 0;
+
+    vq->used_idx = vq->vring.used->idx;
+    vq->resubmit_num = 0;
+    vq->resubmit_list = NULL;
+    vq->counter = 0;
+
+    if (unlikely(vq->log->inflight.used_idx != vq->used_idx)) {
+        vq->log->inflight.desc[vq->log->inflight.last_batch_head].inflight = 0;
+
+        barrier();
+
+        vq->log->inflight.used_idx = vq->used_idx;
+    }
+
+    for (i = 0; i < vq->log->inflight.desc_num; i++) {
+        if (vq->log->inflight.desc[i].inflight == 1) {
+            vq->inuse++;
+        }
+    }
+
+    vq->shadow_avail_idx = vq->last_avail_idx = vq->inuse + vq->used_idx;
+
+    if (vq->inuse) {
+        vq->resubmit_list = calloc(vq->inuse, sizeof(VduseVirtqInflightDesc));
+        if (!vq->resubmit_list) {
+            return -1;
+        }
+
+        for (i = 0; i < vq->log->inflight.desc_num; i++) {
+            if (vq->log->inflight.desc[i].inflight) {
+                vq->resubmit_list[vq->resubmit_num].index = i;
+                vq->resubmit_list[vq->resubmit_num].counter =
+                                        vq->log->inflight.desc[i].counter;
+                vq->resubmit_num++;
+            }
+        }
+
+        if (vq->resubmit_num > 1) {
+            qsort(vq->resubmit_list, vq->resubmit_num,
+                  sizeof(VduseVirtqInflightDesc), inflight_desc_compare);
+        }
+        vq->counter = vq->resubmit_list[0].counter + 1;
+    }
+
+    if (event_notifier_set(&vq->irq_notifier)) {
+        error_report("set irq notifier failed");
+    }
+    if (event_notifier_set(&vq->kick_notifier)) {
+        error_report("set kick notifier failed");
+    }
+
+    return 0;
+}
+
+static int vduse_queue_inflight_get(VduseVirtq *vq, int desc_idx)
+{
+    vq->log->inflight.desc[desc_idx].counter = vq->counter++;
+    vq->log->inflight.desc[desc_idx].inflight = 1;
+
+    return 0;
+}
+
+static int vduse_queue_inflight_pre_put(VduseVirtq *vq, int desc_idx)
+{
+    vq->log->inflight.last_batch_head = desc_idx;
+
+    return 0;
+}
+
+static int vduse_queue_inflight_post_put(VduseVirtq *vq, int desc_idx)
+{
+    vq->log->inflight.desc[desc_idx].inflight = 0;
+
+    barrier();
+
+    vq->log->inflight.used_idx = vq->used_idx;
+
+    return 0;
+}
+
 static inline bool has_feature(uint64_t features, unsigned int fbit)
 {
     assert(fbit < 64);
@@ -29,7 +181,7 @@ static inline bool has_feature(uint64_t features, unsigned int fbit)
 
 static inline bool vduse_dev_has_feature(VduseDev *dev, unsigned int fbit)
 {
-    return has_feature(dev->features, fbit);
+    return has_feature(dev->log->features, fbit);
 }
 
 static void vduse_iova_remove_region(VduseDev *dev, uint64_t start,
@@ -403,10 +555,23 @@ void *vduse_queue_pop(VduseVirtq *vq, size_t sz)
     unsigned int head;
     VduseVirtqElement *elem;
     VduseDev *dev = vq->dev;
+    int i;
 
     if (unlikely(!vq->vring.avail)) {
         error_report("vduse queue pop no avail");
         return NULL;
+    }
+
+    if (unlikely(vq->resubmit_list && vq->resubmit_num > 0)) {
+        i = (--vq->resubmit_num);
+        elem = vduse_queue_map_desc(vq, vq->resubmit_list[i].index, sz);
+
+        if (!vq->resubmit_num) {
+            free(vq->resubmit_list);
+            vq->resubmit_list = NULL;
+        }
+
+        return elem;
     }
 
     if (vduse_queue_empty(vq)) {
@@ -437,6 +602,8 @@ void *vduse_queue_pop(VduseVirtq *vq, size_t sz)
     }
 
     vq->inuse++;
+
+    vduse_queue_inflight_get(vq, head);
 
     return elem;
 }
@@ -495,7 +662,9 @@ void vduse_queue_push(VduseVirtq *vq, const VduseVirtqElement *elem,
                       unsigned int len)
 {
     vduse_queue_fill(vq, elem, len, 0);
+    vduse_queue_inflight_pre_put(vq, elem->index);
     vduse_queue_flush(vq, 1);
+    vduse_queue_inflight_post_put(vq, elem->index);
 }
 
 static void vduse_queue_on_kick(EventNotifier *n)
@@ -553,6 +722,15 @@ int vduse_queue_enable(VduseVirtq *vq)
     vq->enabled = true;
     event_notifier_set_handler(&vq->kick_notifier, vduse_queue_on_kick);
 
+    if (vq->log->vring.ready) {
+        vq->vring.desc = iova_to_va(dev, vq->log->vring.desc);
+        vq->vring.avail = iova_to_va(dev, vq->log->vring.avail);
+        vq->vring.used = iova_to_va(dev, vq->log->vring.used);
+        vq->vring.num = vq->log->vring.num;
+
+        vduse_queue_check_inflights(vq);
+    }
+
     return 0;
 kickfd_cleanup:
     event_notifier_cleanup(&vq->kick_notifier);
@@ -576,6 +754,8 @@ void vduse_queue_disable(VduseVirtq *vq)
 static void vduse_dev_reset(VduseDev *dev)
 {
     int i;
+    size_t log_size = vduse_dev_log_size() +
+                      dev->num_queues * vduse_vq_log_size(dev->queue_size);
 
     for (i = 0; i < dev->num_queues; i++) {
         dev->vqs[i].vring.desc = 0;
@@ -587,6 +767,7 @@ static void vduse_dev_reset(VduseDev *dev)
         dev->vqs[i].used_idx = 0;
         dev->vqs[i].signalled_used_valid = false;
     }
+    memset(dev->log, 0, log_size);
 }
 
 static void vduse_dev_handler(void *opaque)
@@ -605,13 +786,14 @@ static void vduse_dev_handler(void *opaque)
 
     switch (req.type) {
     case VDUSE_SET_FEATURES:
+        dev->log->features = req.features;
         resp.result = dev->ops->set_features(dev, req.features);
-        dev->features = req.features;
         break;
     case VDUSE_GET_FEATURES:
         resp.result = dev->ops->get_features(dev, (uint64_t *)&resp.features);
         break;
     case VDUSE_SET_STATUS:
+        dev->log->status = req.status;
         resp.result = dev->ops->set_status(dev, req.status);
         if (req.status == 0) {
             vduse_dev_reset(dev);
@@ -633,29 +815,30 @@ static void vduse_dev_handler(void *opaque)
     case VDUSE_SET_VQ_NUM:
         vq = &dev->vqs[req.vq_num.index];
         vq->vring.num = req.vq_num.num;
+        vq->log->vring.num = vq->vring.num;
         resp.result = 0;
         break;
     case VDUSE_SET_VQ_ADDR:
         vq = &dev->vqs[req.vq_addr.index];
-        vq->vring.desc_addr = req.vq_addr.desc_addr;
-        vq->vring.avail_addr = req.vq_addr.driver_addr;
-        vq->vring.used_addr = req.vq_addr.device_addr;
+        vq->log->vring.desc = req.vq_addr.desc_addr;
+        vq->log->vring.avail = req.vq_addr.driver_addr;
+        vq->log->vring.used = req.vq_addr.device_addr;
         resp.result = 0;
         break;
     case VDUSE_SET_VQ_READY:
         vq = &dev->vqs[req.vq_ready.index];
         if (req.vq_ready.ready) {
-            vq->vring.desc = iova_to_va(dev, vq->vring.desc_addr);
-            vq->vring.avail = iova_to_va(dev, vq->vring.avail_addr);
-            vq->vring.used = iova_to_va(dev, vq->vring.used_addr);
+            vq->vring.desc = iova_to_va(dev, vq->log->vring.desc);
+            vq->vring.avail = iova_to_va(dev, vq->log->vring.avail);
+            vq->vring.used = iova_to_va(dev, vq->log->vring.used);
         }
-        vq->ready = req.vq_ready.ready;
+        vq->log->vring.ready = req.vq_ready.ready;
         resp.result = 0;
         break;
     case VDUSE_GET_VQ_READY:
         vq = &dev->vqs[req.vq_ready.index];
         resp.vq_ready.index = req.vq_ready.index;
-        resp.vq_ready.ready = vq->ready;
+        resp.vq_ready.ready = vq->log->vring.ready;
         resp.result = 0;
         break;
     case VDUSE_SET_VQ_STATE:
@@ -696,6 +879,15 @@ int vduse_dev_init(VduseDev *dev, uint64_t id, uint32_t device_id,
 {
     int i, ret, vduse_fd, fd;
     struct vduse_dev_config config;
+    size_t log_size = vduse_dev_log_size() +
+                      num_queues * vduse_vq_log_size(queue_size);
+    void *log = vduse_log_get(g_get_tmp_dir(), id, log_size);
+
+    if (!log) {
+        return -ENOMEM;
+    }
+    dev->log = log;
+    log = (void *)((char *)log + vduse_dev_log_size());
 
     vduse_fd = open("/dev/vduse", O_RDWR);
     if (vduse_fd < 0) {
@@ -703,19 +895,23 @@ int vduse_dev_init(VduseDev *dev, uint64_t id, uint32_t device_id,
         return vduse_fd;
     }
 
-    config.id = id;
-    config.device_id = device_id;
-    config.vendor_id = vendor_id;
-    config.vq_num = num_queues;
-    config.vq_size_max = queue_size;
-    config.vq_align = VDUSE_VQ_ALIGN;
-    config.bounce_size = VDUSE_BOUNCE_SIZE;
-
-    fd = ioctl(vduse_fd, VDUSE_CREATE_DEV, &config);
+    fd = ioctl(vduse_fd, VDUSE_GET_DEV, id);
     if (fd < 0) {
-        ret = fd;
-        error_report("Failed to create vduse device: %lu", id);
-        goto err;
+        config.id = id;
+        config.device_id = device_id;
+        config.vendor_id = vendor_id;
+        config.vq_num = num_queues;
+        config.vq_size_max = queue_size;
+        config.vq_align = VDUSE_VQ_ALIGN;
+        config.bounce_size = VDUSE_BOUNCE_SIZE;
+
+        fd = ioctl(vduse_fd, VDUSE_CREATE_DEV, &config);
+        if (fd < 0) {
+            ret = fd;
+            error_report("Failed to create vduse device: %lu, %s", id, strerror(errno));
+            goto err;
+        }
+        memset(log, 0, log_size);
     }
     qemu_set_nonblock(fd);
     qemu_set_fd_handler(fd, vduse_dev_handler, NULL, dev);
@@ -729,6 +925,9 @@ int vduse_dev_init(VduseDev *dev, uint64_t id, uint32_t device_id,
     for (i = 0; i < num_queues; i++) {
         dev->vqs[i].index = i;
         dev->vqs[i].dev = dev;
+        dev->vqs[i].log = log;
+        dev->vqs[i].log->inflight.desc_num = queue_size;
+        log = (void *)((char *)log + vduse_vq_log_size(queue_size));
     }
 
     dev->id = id;
@@ -737,6 +936,13 @@ int vduse_dev_init(VduseDev *dev, uint64_t id, uint32_t device_id,
     dev->ops = ops;
     dev->vduse_fd = vduse_fd;
     dev->fd = fd;
+
+    if (dev->log->status) {
+        dev->ops->set_status(dev, dev->log->status);
+    }
+    if (dev->log->features) {
+        dev->ops->set_features(dev, dev->log->features);
+    }
 
     return 0;
 err:
@@ -755,10 +961,17 @@ err:
 
 void vduse_dev_cleanup(VduseDev *dev)
 {
+    size_t log_size = vduse_dev_log_size() +
+	              dev->num_queues * vduse_vq_log_size(dev->queue_size);
+
+    munmap(dev->log, log_size);
     qemu_set_fd_handler(dev->fd, NULL, NULL, NULL);
     close(dev->fd);
     dev->fd = -1;
-    ioctl(dev->vduse_fd, VDUSE_DESTROY_DEV, dev->id);
+    if (!ioctl(dev->vduse_fd, VDUSE_DESTROY_DEV, dev->id)) {
+        info_report("Destroy vduse dev: %lu", dev->id);
+        vduse_log_destroy(g_get_tmp_dir(), dev->id);
+    }
     close(dev->vduse_fd);
     dev->vduse_fd = -1;
 }
